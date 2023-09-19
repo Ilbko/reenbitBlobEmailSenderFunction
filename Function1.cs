@@ -1,17 +1,14 @@
 using Azure.Storage;
 using Azure.Storage.Blobs;
 using Azure.Storage.Blobs.Models;
-using Azure.Storage.Files.Shares;
-using Azure.Storage.Files.Shares.Models;
 using Azure.Storage.Sas;
 using Microsoft.Azure.Functions.Worker;
-using Microsoft.Azure.WebJobs;
 using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.Logging;
-using Microsoft.Identity.Client.Platforms.Features.DesktopOs.Kerberos;
-using System.IO;
-using System.Net.Mail;
-using System.Net;
+using Azure.Communication.Email;
+using Azure.Security.KeyVault.Secrets;
+using Azure.Core;
+using Azure.Identity;
 
 namespace emailSenderFunction
 {
@@ -19,12 +16,24 @@ namespace emailSenderFunction
     {
         private readonly ILogger _logger;
         private IConfiguration configuration;
+        private SecretClient secretClient;
 
-        public Function1(ILoggerFactory loggerFactory)
+        public Function1(ILoggerFactory loggerFactory, IConfiguration configuration)
         {
             _logger = loggerFactory.CreateLogger<Function1>();
+            this.configuration = configuration;
+            SecretClientOptions options = new SecretClientOptions()
+            {
+                Retry =
+                {
+                    Delay= TimeSpan.FromSeconds(2),
+                    MaxDelay = TimeSpan.FromSeconds(16),
+                    MaxRetries = 5,
+                    Mode = RetryMode.Exponential
+                }
+            };
 
-            configuration = new ConfigurationBuilder().AddUserSecrets<Function1>().Build();
+            secretClient = new SecretClient(new Uri(configuration["AzureKeyValutUrl"]), new DefaultAzureCredential(), options);
         }
 
         [Function("Function1")]
@@ -32,12 +41,12 @@ namespace emailSenderFunction
         {
             _logger.LogInformation($"C# Blob trigger function Processed blob\n Name: {name} \n Data: {myBlob}");
 
-            string? accountName = configuration.GetSection("azureCredentials")["accountName"];
-            string? accountKey = configuration.GetSection("azureCredentials")["accountKey"];
-            string? containerName = configuration.GetSection("azureInfo")["containerName"];
+            var accountName = await secretClient.GetSecretAsync("azureAccountName");
+            var accountKey = await secretClient.GetSecretAsync("azureAccountKey");
+            var containerName = await secretClient.GetSecretAsync("azureContainerName");
 
             var blobServiceClient = new BlobServiceClient(configuration["settingConnection"]);
-            var blobContainerClient = blobServiceClient.GetBlobContainerClient(configuration.GetSection("azureInfo")["containerName"]);
+            var blobContainerClient = blobServiceClient.GetBlobContainerClient(containerName.Value.Value);
             var blobClient = blobContainerClient.GetBlobClient(name);
             BlobProperties blobProperties = await blobClient.GetPropertiesAsync();
 
@@ -46,7 +55,7 @@ namespace emailSenderFunction
 
             var blobSasBuilder = new BlobSasBuilder()
             {
-                BlobContainerName = containerName,
+                BlobContainerName = containerName.Value.Value,
                 BlobName = name,
                 Resource = "b",
                 ExpiresOn = DateTime.Now.AddHours(1)
@@ -54,11 +63,11 @@ namespace emailSenderFunction
             blobSasBuilder.SetPermissions(BlobAccountSasPermissions.Read);
 
             var storageSharedKeyCredential = new StorageSharedKeyCredential(
-                accountName,
-                accountKey);
+                accountName.Value.Value,
+                accountKey.Value.Value);
 
             var sasQueryParameters = blobSasBuilder.ToSasQueryParameters(storageSharedKeyCredential);
-            UriBuilder fileSasUri = new UriBuilder($"https://{accountName}.blob.core.windows.net/{blobSasBuilder.BlobContainerName}/{blobSasBuilder.BlobName}");
+            UriBuilder fileSasUri = new UriBuilder($"https://{accountName.Value.Value}.blob.core.windows.net/{blobSasBuilder.BlobContainerName}/{blobSasBuilder.BlobName}");
             fileSasUri.Query = sasQueryParameters.ToString();
 
             string email = blobProperties.Metadata["Email"];
@@ -68,29 +77,25 @@ namespace emailSenderFunction
             return;         
         }
 
-        private void SendEmail(string email, string uri)
+        private async Task SendEmail(string email, string uri)
         {
-            string? fromEmail = configuration.GetSection("gmailCredentials")["accountEmail"];
-            string? fromPassword = configuration.GetSection("gmailCredentials")["accountPassword"];
+            var connectionString = await secretClient.GetSecretAsync("emailConnectionString");
+            var fromEmail = await secretClient.GetSecretAsync("emailFrom");
+          
+            var emailClient = new EmailClient(connectionString.Value.Value);
 
-            MailAddress fromAddress = new MailAddress(fromEmail);
-
-            SmtpClient smtpClient = new SmtpClient("smtp.gmail.com", 587)
+            try
             {
-                Credentials = new NetworkCredential(fromAddress.Address, fromPassword),
-                EnableSsl = true
-            };
-
-            MailMessage mailMessage = new MailMessage()
+                var emailSendOperation = await emailClient.SendAsync(
+                    Azure.WaitUntil.Completed,
+                    senderAddress: fromEmail.Value.Value,
+                    recipientAddress: email,
+                    subject: "Your uploaded file (1 hour access)",
+                    htmlContent: uri);
+            } catch (Exception ex)
             {
-                Subject = "Your uploaded file (1 hour access)",
-                Body = uri,
-                IsBodyHtml = false,
-                From = fromAddress,
-            };
-            mailMessage.To.Add(email);
-
-            smtpClient.Send(mailMessage);
+                _logger.LogInformation(ex, ex.Message);
+            }
         }
     }
 }
